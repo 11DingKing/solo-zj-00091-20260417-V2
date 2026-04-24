@@ -18,6 +18,8 @@ RUN apt-get update \
   && apt-get install -y libpq-dev \
   && apt-get install -y gettext \
   && apt-get -y install netcat-openbsd gcc postgresql \
+  && apt-get install -y libgdal-dev \
+  && apt-get install -y binutils libproj-dev \
   && apt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false \
   && rm -rf /var/lib/apt/lists/*
 

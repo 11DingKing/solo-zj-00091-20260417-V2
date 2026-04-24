@@ -5,6 +5,11 @@ const getProperties = async () => {
   return response.data;
 };
 
-const propertyAPIService = { getProperties };
+const searchProperties = async (searchParams) => {
+  const response = await apiClient.post("/properties/search/", searchParams);
+  return response.data;
+};
+
+const propertyAPIService = { getProperties, searchProperties };
 
 export default propertyAPIService;
