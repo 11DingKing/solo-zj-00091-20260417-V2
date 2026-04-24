@@ -1,7 +1,13 @@
+import hashlib
+import json
 import logging
+import re
 
 import django_filters
-from django.db.models import query
+from django.contrib.gis.db.models.functions import Distance
+from django.contrib.gis.geos import Point
+from django.core.cache import cache
+from django.db.models import Q
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters, generics, permissions, status
 from rest_framework.decorators import api_view, permission_classes
@@ -15,6 +21,32 @@ from .serializers import (PropertyCreateSerializer, PropertySerializer,
                           PropertyViewSerializer)
 
 logger = logging.getLogger(__name__)
+
+CACHE_TIMEOUT = 300
+
+
+def chinese_tokenize(text):
+    if not text:
+        return []
+    tokens = []
+    chinese_pattern = re.compile(r"[\u4e00-\u9fff]+")
+    english_pattern = re.compile(r"[a-zA-Z]+")
+    number_pattern = re.compile(r"\d+")
+
+    for match in chinese_pattern.finditer(text):
+        word = match.group()
+        for i in range(len(word)):
+            for j in range(i + 1, min(i + 5, len(word) + 1)):
+                tokens.append(word[i:j])
+        tokens.append(word)
+
+    for match in english_pattern.finditer(text):
+        tokens.append(match.group().lower())
+
+    for match in number_pattern.finditer(text):
+        tokens.append(match.group())
+
+    return list(set(tokens))
 
 
 class PropertyFilter(django_filters.FilterSet):
@@ -180,68 +212,229 @@ class PropertySearchAPIView(APIView):
     permission_classes = [permissions.AllowAny]
     serializer_class = PropertyCreateSerializer
 
+    def _generate_cache_key(self, params):
+        sorted_params = json.dumps(params, sort_keys=True)
+        cache_key = f"property_search:{hashlib.md5(sorted_params.encode()).hexdigest()}"
+        return cache_key
+
+    def _parse_price_range(self, price_str):
+        if not price_str or price_str == "Any":
+            return None, None
+
+        price_str = str(price_str).strip()
+
+        if "-" in price_str:
+            parts = price_str.split("-")
+            min_price = self._parse_price_value(parts[0]) if len(parts) > 0 else None
+            max_price = self._parse_price_value(parts[1]) if len(parts) > 1 else None
+            return min_price, max_price
+
+        price_value = self._parse_price_value(price_str)
+        if price_value is not None:
+            return price_value, None
+
+        return None, None
+
+    def _parse_price_value(self, price_str):
+        if not price_str:
+            return None
+        price_str = str(price_str).strip().replace("$", "").replace(",", "").replace("+", "")
+        try:
+            return float(price_str)
+        except (ValueError, TypeError):
+            return None
+
+    def _parse_bedrooms(self, bedrooms_str):
+        if not bedrooms_str:
+            return None
+        bedrooms_str = str(bedrooms_str).strip()
+        if bedrooms_str == "0+":
+            return 0
+        elif bedrooms_str == "1+":
+            return 1
+        elif bedrooms_str == "2+":
+            return 2
+        elif bedrooms_str == "3+":
+            return 3
+        elif bedrooms_str == "4+":
+            return 4
+        elif bedrooms_str == "5+":
+            return 5
+        try:
+            return int(bedrooms_str.replace("+", ""))
+        except (ValueError, TypeError):
+            return None
+
+    def _parse_bathrooms(self, bathrooms_str):
+        if not bathrooms_str:
+            return None
+        bathrooms_str = str(bathrooms_str).strip()
+        if bathrooms_str == "0+":
+            return 0.0
+        elif bathrooms_str == "1+":
+            return 1.0
+        elif bathrooms_str == "2+":
+            return 2.0
+        elif bathrooms_str == "3+":
+            return 3.0
+        elif bathrooms_str == "4+":
+            return 4.0
+        try:
+            return float(bathrooms_str.replace("+", ""))
+        except (ValueError, TypeError):
+            return None
+
+    def _build_search_query(self, keywords):
+        if not keywords:
+            return Q()
+
+        tokens = chinese_tokenize(keywords)
+        if not tokens:
+            return Q()
+
+        query = Q()
+        for token in tokens:
+            token_query = (
+                Q(title__icontains=token) |
+                Q(description__icontains=token) |
+                Q(city__icontains=token) |
+                Q(street_address__icontains=token) |
+                Q(ref_code__icontains=token)
+            )
+            query &= token_query
+
+        return query
+
+    def _build_filters(self, data):
+        filters = Q(published_status=True)
+
+        city = data.get("city")
+        if city:
+            filters &= Q(city__icontains=city)
+
+        country = data.get("country")
+        if country:
+            filters &= Q(country__iexact=country)
+
+        advert_type = data.get("advert_type")
+        if advert_type:
+            filters &= Q(advert_type__iexact=advert_type)
+
+        property_type = data.get("property_type")
+        if property_type:
+            filters &= Q(property_type__iexact=property_type)
+
+        price = data.get("price")
+        price_min = data.get("price_min")
+        price_max = data.get("price_max")
+
+        if price_min or price_max:
+            if price_min:
+                min_price = self._parse_price_value(price_min)
+                if min_price is not None:
+                    filters &= Q(price__gte=min_price)
+            if price_max:
+                max_price = self._parse_price_value(price_max)
+                if max_price is not None:
+                    filters &= Q(price__lte=max_price)
+        elif price:
+            min_price, max_price = self._parse_price_range(price)
+            if min_price is not None:
+                filters &= Q(price__gte=min_price)
+            if max_price is not None:
+                filters &= Q(price__lte=max_price)
+
+        bedrooms = data.get("bedrooms")
+        if bedrooms:
+            min_bedrooms = self._parse_bedrooms(bedrooms)
+            if min_bedrooms is not None:
+                filters &= Q(bedrooms__gte=min_bedrooms)
+
+        bathrooms = data.get("bathrooms")
+        if bathrooms:
+            min_bathrooms = self._parse_bathrooms(bathrooms)
+            if min_bathrooms is not None:
+                filters &= Q(bathrooms__gte=min_bathrooms)
+
+        keywords = data.get("keywords") or data.get("catch_phrase")
+        if keywords:
+            keyword_query = self._build_search_query(keywords)
+            filters &= keyword_query
+
+        return filters
+
+    def _apply_location_filter(self, queryset, data):
+        latitude = data.get("latitude")
+        longitude = data.get("longitude")
+        radius = data.get("radius")
+
+        if latitude is None or longitude is None:
+            return queryset, None
+
+        try:
+            latitude = float(latitude)
+            longitude = float(longitude)
+        except (ValueError, TypeError):
+            return queryset, None
+
+        user_location = Point(longitude, latitude, srid=4326)
+
+        queryset = queryset.filter(location__isnull=False)
+
+        if radius:
+            try:
+                radius_meters = float(radius) * 1000
+                queryset = queryset.annotate(
+                    distance=Distance("location", user_location)
+                ).filter(distance__lte=radius_meters)
+            except (ValueError, TypeError):
+                pass
+
+        return queryset, user_location
+
+    def _apply_sorting(self, queryset, data, user_location):
+        sort_by = data.get("sort_by", "created_at")
+        sort_order = data.get("sort_order", "desc")
+
+        sort_mapping = {
+            "price": "price",
+            "distance": "distance",
+            "created_at": "created_at",
+            "views": "views",
+        }
+
+        sort_field = sort_mapping.get(sort_by, "created_at")
+
+        if sort_field == "distance" and user_location:
+            if "distance" not in [annot.split("__")[0] for annot in queryset.query.annotations]:
+                queryset = queryset.annotate(distance=Distance("location", user_location))
+
+        if sort_order == "asc":
+            queryset = queryset.order_by(sort_field)
+        else:
+            queryset = queryset.order_by(f"-{sort_field}")
+
+        return queryset
+
     def post(self, request):
-        queryset = Property.objects.filter(published_status=True)
-        data = self.request.data
+        data = request.data
 
-        advert_type = data["advert_type"]
-        queryset = queryset.filter(advert_type__iexact=advert_type)
+        cache_key = self._generate_cache_key(dict(data))
+        cached_result = cache.get(cache_key)
+        if cached_result:
+            return Response(cached_result)
 
-        property_type = data["property_type"]
-        queryset = queryset.filter(property_type__iexact=property_type)
+        filters = self._build_filters(data)
 
-        price = data["price"]
-        if price == "$0+":
-            price = 0
-        elif price == "$50,000+":
-            price = 50000
-        elif price == "$100,000+":
-            price = 100000
-        elif price == "$200,000+":
-            price = 200000
-        elif price == "$400,000+":
-            price = 400000
-        elif price == "$600,000+":
-            price = 600000
-        elif price == "Any":
-            price = -1
+        queryset = Property.objects.filter(filters)
 
-        if price != -1:
-            queryset = queryset.filter(price__gte=price)
+        queryset, user_location = self._apply_location_filter(queryset, data)
 
-        bedrooms = data["bedrooms"]
-        if bedrooms == "0+":
-            bedrooms = 0
-        elif bedrooms == "1+":
-            bedrooms = 1
-        elif bedrooms == "2+":
-            bedrooms = 2
-        elif bedrooms == "3+":
-            bedrooms = 3
-        elif bedrooms == "4+":
-            bedrooms = 4
-        elif bedrooms == "5+":
-            bedrooms = 5
+        queryset = self._apply_sorting(queryset, data, user_location)
 
-        queryset = queryset.filter(bedrooms__gte=bedrooms)
+        serializer = PropertySerializer(queryset, many=True, context={"request": request})
+        result = serializer.data
 
-        bathrooms = data["bathrooms"]
-        if bathrooms == "0+":
-            bathrooms = 0.0
-        elif bathrooms == "1+":
-            bathrooms = 1.0
-        elif bathrooms == "2+":
-            bathrooms = 2.0
-        elif bathrooms == "3+":
-            bathrooms = 3.0
-        elif bathrooms == "4+":
-            bathrooms = 4.0
+        cache.set(cache_key, result, CACHE_TIMEOUT)
 
-        queryset = queryset.filter(bathrooms__gte=bathrooms)
-
-        catch_phrase = data["catch_phrase"]
-        queryset = queryset.filter(description__icontains=catch_phrase)
-
-        serializer = PropertySerializer(queryset, many=True)
-
-        return Response(serializer.data)
+        return Response(result)

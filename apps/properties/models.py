@@ -3,6 +3,8 @@ import string
 
 from autoslug import AutoSlugField
 from django.contrib.auth import get_user_model
+from django.contrib.gis.db import models as gis_models
+from django.contrib.gis.geos import Point
 from django.core.validators import MinValueValidator
 from django.db import models
 from django.utils.translation import gettext_lazy as _
@@ -131,6 +133,13 @@ class Property(TimeStampedUUIDModel):
         verbose_name=_("Published Status"), default=False
     )
     views = models.IntegerField(verbose_name=_("Total Views"), default=0)
+    location = gis_models.PointField(
+        verbose_name=_("Geographic Location"),
+        geography=True,
+        null=True,
+        blank=True,
+        help_text=_("Store the geographic coordinates (longitude, latitude)"),
+    )
 
     objects = models.Manager()
     published = PropertyPublishedManager()
@@ -141,6 +150,15 @@ class Property(TimeStampedUUIDModel):
     class Meta:
         verbose_name = "Property"
         verbose_name_plural = "Properties"
+        indexes = [
+            models.Index(fields=["price"], name="property_price_idx"),
+            models.Index(fields=["created_at"], name="property_created_at_idx"),
+            models.Index(fields=["city"], name="property_city_idx"),
+            models.Index(fields=["bedrooms"], name="property_bedrooms_idx"),
+            models.Index(fields=["advert_type"], name="property_advert_type_idx"),
+            models.Index(fields=["property_type"], name="property_property_type_idx"),
+            gis_models.GistIndex(fields=["location"], name="property_location_gist_idx"),
+        ]
 
     def save(self, *args, **kwargs):
         self.title = str.title(self.title)
